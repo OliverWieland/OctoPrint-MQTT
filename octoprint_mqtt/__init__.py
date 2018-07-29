@@ -7,6 +7,9 @@ from collections import deque
 
 import octoprint.plugin
 
+from octoprint.events import Events
+from octoprint.util import dict_minimal_mergediff
+
 class MqttPlugin(octoprint.plugin.SettingsPlugin,
                  octoprint.plugin.StartupPlugin,
                  octoprint.plugin.ShutdownPlugin,
@@ -15,6 +18,31 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
                  octoprint.plugin.TemplatePlugin,
                  octoprint.plugin.AssetPlugin,
                  octoprint.printer.PrinterCallback):
+
+	EVENT_CLASS_TO_EVENT_LIST = dict(server   = (Events.STARTUP, Events.SHUTDOWN, Events.CLIENT_OPENED,
+	                                             Events.CLIENT_CLOSED, Events.CONNECTIVITY_CHANGED),
+	                                 comm     = (Events.CONNECTING, Events.CONNECTED, Events.DISCONNECTING,
+	                                             Events.DISCONNECTED, Events.ERROR, Events.PRINTER_STATE_CHANGED),
+	                                 files    = (Events.UPLOAD, Events.FILE_ADDED, Events.FILE_REMOVED,
+	                                             Events.FOLDER_ADDED, Events.FOLDER_REMOVED, Events.UPDATED_FILES,
+	                                             Events.METADATA_ANALYSIS_STARTED, Events.METADATA_ANALYSIS_FINISHED,
+	                                             Events.FILE_SELECTED, Events.FILE_DESELECTED, Events.TRANSFER_STARTED,
+	                                             Events.TRANSFER_FAILED, Events.TRANSFER_DONE),
+	                                 printjob = (Events.PRINT_STARTED, Events.PRINT_FAILED, Events.PRINT_DONE,
+	                                             Events.PRINT_CANCELLED, Events.PRINT_PAUSED, Events.PRINT_RESUMED),
+	                                 gcode    = (Events.POWER_ON, Events.POWER_OFF, Events.HOME, Events.Z_CHANGE,
+	                                             Events.DWELL, Events.WAITING, Events.COOLING, Events.ALERT,
+	                                             Events.CONVEYOR, Events.EJECT, Events.E_STOP, Events.POSITION_UPDATE,
+	                                             Events.TOOL_CHANGE),
+	                                 timelapse= (Events.CAPTURE_START, Events.CAPTURE_FAILED, Events.CAPTURE_DONE,
+	                                             Events.MOVIE_RENDERING, Events.MOVIE_FAILED, Events.MOVIE_FAILED),
+	                                 slicing  = (Events.SLICING_STARTED, Events.SLICING_DONE, Events.SLICING_CANCELLED,
+	                                             Events.SLICING_FAILED, Events.SLICING_PROFILE_ADDED,
+	                                             Events.SLICING_PROFILE_DELETED, Events.SLICING_PROFILE_MODIFIED),
+	                                 settings = (Events.SETTINGS_UPDATED,))
+
+	LWT_CONNECTED = "connected"
+	LWT_DISCONNECTED = "disconnected"
 
 	def __init__(self):
 		self._mqtt = None
@@ -26,8 +54,6 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 		self._mqtt_subscribe_queue = deque()
 
 		self.lastTemp = {}
-
-
 
 	def initialize(self):
 		self._printer.register_callback(self)
@@ -74,37 +100,71 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 			),
 			publish=dict(
 				baseTopic="octoprint/",
+
 				eventTopic="event/{event}",
 				eventActive=True,
-				eventServerActive=True,
-				eventPrintCommActive=True,
-				eventFileHandlActive=True,
-				eventPrintingActive=True,
-				eventGCodePrcActive=True,
-				eventTimelapsesActive=True,
-				eventSlicingActive=True,
-				eventSettingsActive=True,
+				events=dict(server=True,
+				            comm=True,
+				            files=True,
+				            printjob=True,
+				            gcode=True,
+				            timelapse=True,
+				            slicing=True,
+				            settings=True,
+				            unclassified=True),
+
 				progressTopic="progress/{progress}",
 				progressActive=True,
+
 				temperatureTopic="temperature/{temp}",
 				temperatureActive=True,
-				temperatureThreshold=0.1
+				temperatureThreshold=0.1,
+
+				lwTopic="mqtt",
+				lwActive=True
 			)
 		)
+
+	def on_settings_save(self, data):
+		old_broker_data = self._settings.get(["broker"])
+		old_lw_active = self._settings.get_boolean(["publish", "lwActive"])
+		old_lw_topic = self._get_topic("lw")
+
+		octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
+
+		new_broker_data = self._settings.get(["broker"])
+		new_lw_active = self._settings.get_boolean(["publish", "lwActive"])
+		new_lw_topic = self._get_topic("lw")
+
+		broker_diff = dict_minimal_mergediff(old_broker_data, new_broker_data)
+		lw_diff = dict_minimal_mergediff(dict(lw_active=old_lw_active,
+		                                      lw_topic=old_lw_topic),
+		                                 dict(lw_active=new_lw_active,
+		                                      lw_topic=new_lw_topic))
+		if len(broker_diff) or len(lw_diff):
+			# something changed
+			self._logger.info("Settings changed (broker_diff={!r}, lw_diff={!r}), reconnecting to broker".format(broker_diff, lw_diff))
+			self.mqtt_disconnect(force=True, incl_lwt=old_lw_active, lwt=old_lw_topic)
+			self.mqtt_connect()
 
 	##~~ EventHandlerPlugin API
 
 	def on_event(self, event, payload):
+		if event == Events.PRINT_STARTED:
+			self.on_print_progress(payload["origin"], payload["path"], 0)
+		elif event == Events.PRINT_DONE:
+			self.on_print_progress(payload["origin"], payload["path"], 100)
+
 		topic = self._get_topic("event")
 
 		if topic:
-			if self._is_active(event):
+			if self._is_event_active(event):
 				if payload is None:
 					data = dict()
 				else:
 					data = dict(payload)
 				data["_event"] = event
-				self.mqtt_publish(topic.format(event=event), json.dumps(data))
+				self.mqtt_publish_with_timestamp(topic.format(event=event), data)
 
 	##~~ ProgressPlugin API
 
@@ -115,7 +175,7 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 			data = dict(location=storage,
 			            path=path,
 			            progress=progress)
-			self.mqtt_publish(topic.format(progress="printing"), json.dumps(data), retained=True)
+			self.mqtt_publish_with_timestamp(topic.format(progress="printing"), data, retained=True)
 
 	def on_slicing_progress(self, slicer, source_location, source_path, destination_location, destination_path, progress):
 		topic = self._get_topic("progress")
@@ -127,13 +187,13 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 			            destination_location=destination_location,
 			            destination_path=destination_path,
 			            progress=progress)
-			self.mqtt_publish(topic.format(progress="slicing"), json.dumps(data), retained=True)
+			self.mqtt_publish_with_timestamp(topic.format(progress="slicing"), data, retained=True)
 
 	##~~ PrinterCallback
 
 	def on_printer_add_temperature(self, data):
 		topic = self._get_topic("temperature")
-		threshold = self._settings.getFloat(["publish", "temperatureThreshold"])
+		threshold = self._settings.get_float(["publish", "temperatureThreshold"])
 
 		if topic:
 			for key, value in data.items():
@@ -146,7 +206,10 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 					# unknown key, new actual or new target -> update mqtt topic!
 					dataset = dict(actual=value["actual"],
 					               target=value["target"])
-					self.mqtt_publish(topic.format(temp=key), json.dumps(dataset), retained=True, allow_queueing=True)
+					self.mqtt_publish_with_timestamp(topic.format(temp=key), dataset,
+					                                 retained=True,
+					                                 allow_queueing=True,
+					                                 timestamp=data["time"])
 					self.lastTemp.update({key:data[key]})
 
 	##~~ Softwareupdate hook
@@ -171,8 +234,6 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 	##~~ helpers
 
 	def mqtt_connect(self):
-		# TODO LWT
-
 		broker_url = self._settings.get(["broker", "url"])
 		broker_port = self._settings.get_int(["broker", "port"])
 		broker_username = self._settings.get(["broker", "username"])
@@ -182,7 +243,11 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 		broker_tls_insecure = self._settings.get_boolean(["broker", "tls_insecure"])
 		broker_protocol = self._settings.get(["broker", "protocol"])
 
+		lw_active = self._settings.get_boolean(["publish", "lwActive"])
+		lw_topic = self._get_topic("lw")
+
 		if broker_url is None:
+			self._logger.warn("Broker URL is None, can't connect to broker")
 			return
 
 		import paho.mqtt.client as mqtt
@@ -211,16 +276,29 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 		if broker_tls_insecure and tls_active:
 			self._mqtt.tls_insecure_set(broker_tls_insecure)
 
+		if lw_active and lw_topic:
+			self._mqtt.will_set(lw_topic, self.LWT_DISCONNECTED, qos=1, retain=True)
+
 		self._mqtt.on_connect = self._on_mqtt_connect
 		self._mqtt.on_disconnect = self._on_mqtt_disconnect
 		self._mqtt.on_message = self._on_mqtt_message
 
 		self._mqtt.connect_async(broker_url, broker_port, keepalive=broker_keepalive)
-		self._mqtt.loop_start()
+		if self._mqtt.loop_start() == mqtt.MQTT_ERR_INVAL:
+			self._logger.error("Could not start MQTT connection, loop_start returned MQTT_ERR_INVAL")
 
-	def mqtt_disconnect(self, force=False):
+		if lw_active and lw_topic:
+			self._mqtt.publish(lw_topic, self.LWT_CONNECTED, qos=1, retain=True)
+
+	def mqtt_disconnect(self, force=False, incl_lwt=True, lwt=None):
 		if self._mqtt is None:
 			return
+
+		if incl_lwt:
+			if lwt is None:
+				lwt = self._get_topic("lw")
+			if lwt:
+				self._mqtt.publish(lwt, self.LWT_DISCONNECTED, qos=1, retain=True)
 
 		self._mqtt.loop_stop()
 
@@ -228,10 +306,25 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 			time.sleep(1)
 			self._mqtt.loop_stop(force=True)
 
+	def mqtt_publish_with_timestamp(self, topic, payload, retained=False, qos=0, allow_queueing=False, timestamp=None):
+		if not payload:
+			payload = dict()
+		if not isinstance(payload, dict):
+			raise ValueError("payload must be a dict")
+
+		if timestamp is None:
+			timestamp = time.time()
+		payload["_timestamp"] = int(timestamp)
+
+		return self.mqtt_publish(topic, payload, retained=retained, qos=qos, allow_queueing=allow_queueing)
+
 	def mqtt_publish(self, topic, payload, retained=False, qos=0, allow_queueing=False):
+		if not isinstance(payload, basestring):
+			payload = json.dumps(payload)
+
 		if not self._mqtt_connected:
 			if allow_queueing:
-				self._logger.debug("Not connected, enqueing message: {topic} - {payload}".format(**locals()))
+				self._logger.debug("Not connected, enqueuing message: {topic} - {payload}".format(**locals()))
 				self._mqtt_publish_queue.append((topic, payload, retained, qos))
 				return True
 			else:
@@ -313,7 +406,9 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 			return
 
 		if not rc == 0:
-			self._logger.error("Disconnected from mqtt broker for unknown reasons")
+			self._logger.error("Disconnected from mqtt broker for unknown reasons (network error?), rc = {}".format(rc))
+		else:
+			self._logger.info("Disconnected from mqtt broker")
 
 		self._mqtt_connected = False
 
@@ -340,25 +435,11 @@ class MqttPlugin(octoprint.plugin.SettingsPlugin,
 
 		return self._settings.get(["publish", "baseTopic"]) + sub_topic
 
-	def _is_active(self, event):
-		if event in ["Startup", "Shutdown","ClientOpened","ClientClosed","ConnectivityChanged"]:
-			return self._settings.get_boolean(["publish", "eventServerActive"])
-		if event in ["Connecting","Connected","Disconnecting","Disconnected","Error","PrinterStateChanged"]:
-			return self._settings.get_boolean(["publish", "eventPrintCommActive"])
-		if event in ["Upload","FileAdded","FileRemoved","FolderAdded","FolderRemoved","UpdatedFiles","MetadataAnalysisStarted","MetadataAnalysisFinished","FileSelected","FileDeselected","TransferStarted","TransferDone"]:
-			return self._settings.get_boolean(["publish", "eventFileHandlActive"])
-		if event in ["PrintStarted","PrintFailed","PrintDone","PrintCancelled","PrintPaused","PrintResumed"]:
-			return self._settings.get_boolean(["publish", "eventPrintingActive"])
-		if event in ["PowerOn","PowerOff","Home","ZChange","Dwell","Waiting","Cooling","Alert","Conveyor","Eject","EStop","PositionUpdate","ToolChange"]:
-			return self._settings.get_boolean(["publish", "eventGCodePrcActive"])
-		if event in ["CaptureStart","CaptureDone","CaptureFailed","MovieRendering","MovieDone","MovieFailed"]:
-			return self._settings.get_boolean(["publish", "eventTimelapsesActive"])
-		if event in ["SlicingStarted","SlicingDone","SlicingCancelled","SlicingFailed","SlicingProfileAdded","SlicingProfileModified","SlicingProfileDeleted"]:
-			return self._settings.get_boolean(["publish", "eventSlicingActive"])
-		if event == "SettingsUpdated":
-			return self._settings.get_boolean(["publish", "eventSettingsActive"])
-		return False
-
+	def _is_event_active(self, event):
+		for event_class, events in self.EVENT_CLASS_TO_EVENT_LIST.items():
+			if event in events:
+				return self._settings.get_boolean(["publish", "events", event_class])
+		return self._settings.get_boolean(["publish", "events", "unclassified"])
 
 
 __plugin_name__ = "MQTT"
@@ -369,6 +450,7 @@ def __plugin_load__():
 	global __plugin_helpers__
 	__plugin_helpers__ = dict(
 		mqtt_publish=plugin.mqtt_publish,
+		mqtt_publish_with_timestamp=plugin.mqtt_publish_with_timestamp,
 		mqtt_subscribe=plugin.mqtt_subscribe,
 		mqtt_unsubscribe=plugin.mqtt_unsubscribe
 	)
